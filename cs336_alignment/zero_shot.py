@@ -2,7 +2,6 @@
 Evaluate Qwen 2.5 Math 1.B zero-shot performance on GSM8K
 """
 # Imports
-from sympy.strategies.tree import allresults
 from vllm import LLM, SamplingParams
 import jsonlines
 from datetime import datetime
@@ -13,7 +12,7 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 MODEL_NAME = "Qwen/Qwen2.5-Math-1.5B"
 DATASET_PATH = "data/gsm8k/test.jsonl"
 OUTPUT_FILE = f"qwen25_1_5b_gsm8k_vllm_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-LIMIT_SAMPLES = 1
+LIMIT_SAMPLES = None
 
 # R1_ZERO_PROMPT from cs336_alignment/prompts/*
 R1_ZERO_PROMPT = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
@@ -31,9 +30,10 @@ def main():
     questions = [qa['question'] for qa in data]
     answers = [qa['answer'] for qa in data]
 
+    ground_truths = [a.split("#### ")[1] for a in answers]
+
     # 2. format them as string prompts to the language model using the r1_zero prompt
     prompts = [R1_ZERO_PROMPT.format(question=q) for q in questions]
-    print(prompts[0])
 
     sampling_params = SamplingParams(
         temperature=1.0, top_p=1.0, max_tokens=1024, stop=["</answer>"], include_stop_str_in_output=True
@@ -74,7 +74,7 @@ def evaluate_vllm(
             **metrics
         }
 
-        allresults.append(result_entry)
+        all_results.append(result_entry)
     
     total_examples = len(prompts)
     final_accuracy = total_correct / total_examples
