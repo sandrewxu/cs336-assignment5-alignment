@@ -1,3 +1,10 @@
+"""
+SFT-specific functions
+"""
+
+import torch
+from typing import Dict
+
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,

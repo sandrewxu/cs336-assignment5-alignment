@@ -2,17 +2,10 @@
 SFT and RL Helper Methods
 """
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional
 from transformers import PreTrainedTokenizer, PreTrainedModel
-
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
 
 def tokenize_prompt_and_output(
     prompt_strs: List[str],
