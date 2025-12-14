@@ -5,8 +5,14 @@ SFT and RL Helper Methods
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Dict, List
+from typing import Dict, List, Optional, Callable
 from transformers import PreTrainedTokenizer, PreTrainedModel
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 def tokenize_prompt_and_output(
     prompt_strs: List[str],
@@ -174,12 +180,24 @@ def log_generations(
     prompts: List[str],
     ground_truths: List[str],
     step: int,
-    reward_fn: Optional[callable] = None,
-    max_new_tokens: int = 128,
+    reward_fn: Optional[Callable[[str, str], Dict[str, float]]] = None,
+    max_new_tokens: int = 1024,
     **kwargs
 ) -> None:
     """
-    descriptions
+    Generate responses from the model for given prompts, compute rewards if a reward function
+    is provided, and log the results.
+    
+    Args:
+        model: The language model to generate from
+        tokenizer: Tokenizer for the model
+        prompts: List of prompt strings
+        ground_truths: List of ground truth answer strings
+        step: Current training step (for logging)
+        reward_fn: Optional function that takes (response, ground_truth) and returns a dict
+                   with reward metrics (e.g., {"reward": float, "format_reward": float, ...})
+        max_new_tokens: Maximum number of tokens to generate
+        **kwargs: Additional arguments to pass to model.generate()
     """
     model.eval()
 
@@ -201,12 +219,66 @@ def log_generations(
 
     rewards = []
     correct_flags = []
+    format_rewards = []
+    answer_rewards = []
 
     if reward_fn:
-        reward_results = reward_fn(responses, ground_truths)
-        # TODO: fix!!
+        for response, ground_truth in zip(responses, ground_truths):
+            metrics = reward_fn(response, ground_truth)
+            rewards.append(metrics.get("reward", 0.0))
+            correct_flags.append(metrics.get("reward", 0.0) > 0.5)  # Consider correct if reward > 0.5
+            format_rewards.append(metrics.get("format_reward", 0.0))
+            answer_rewards.append(metrics.get("answer_reward", 0.0))
 
     response_lens = [len(t) for t in generated_tokens]
     avg_len = np.mean(response_lens)
+
+    # Prepare metrics for logging
+    log_metrics = {
+        "generation/num_generations": len(responses),
+        "generation/avg_response_length": avg_len,
+    }
+    
+    if reward_fn:
+        avg_reward = np.mean(rewards) if rewards else 0.0
+        accuracy = np.mean(correct_flags) if correct_flags else 0.0
+        avg_format_reward = np.mean(format_rewards) if format_rewards else 0.0
+        avg_answer_reward = np.mean(answer_rewards) if answer_rewards else 0.0
+        
+        log_metrics.update({
+            "generation/avg_reward": avg_reward,
+            "generation/accuracy": accuracy,
+            "generation/avg_format_reward": avg_format_reward,
+            "generation/avg_answer_reward": avg_answer_reward,
+        })
+
+    # Log to wandb if available and initialized
+    if WANDB_AVAILABLE and wandb.run is not None:
+        wandb.log(log_metrics, step=step)
+
+    # Log the results to console
+    print(f"\n{'='*60}")
+    print(f"Generation Log - Step {step}")
+    print(f"{'='*60}")
+    print(f"Number of generations: {len(responses)}")
+    print(f"Average response length: {avg_len:.2f} tokens")
+    
+    if reward_fn:
+        print(f"Average reward: {avg_reward:.4f}")
+        print(f"Accuracy (reward > 0.5): {accuracy:.4f}")
+        print(f"Average format reward: {avg_format_reward:.4f}")
+        print(f"Average answer reward: {avg_answer_reward:.4f}")
+        
+        # Print a few example generations
+        print(f"\nExample generations (showing first 3):")
+        for i in range(min(3, len(responses))):
+            print(f"\n  Example {i+1}:")
+            print(f"    Prompt: {prompts[i][:100]}..." if len(prompts[i]) > 100 else f"    Prompt: {prompts[i]}")
+            print(f"    Response: {responses[i][:200]}..." if len(responses[i]) > 200 else f"    Response: {responses[i]}")
+            print(f"    Ground truth: {ground_truths[i]}")
+            if reward_fn:
+                print(f"    Reward: {rewards[i]:.4f} (format: {format_rewards[i]:.4f}, answer: {answer_rewards[i]:.4f})")
+    
+    print(f"{'='*60}\n")
 
     model.train()
