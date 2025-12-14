@@ -3,8 +3,9 @@ SFT and RL Helper Methods
 """
 
 import torch
+import torch.nn.functional as F
 from typing import Dict, List
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, PreTrainedModel
 
 def tokenize_prompt_and_output(
     prompt_strs: List[str],
@@ -80,3 +81,73 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     expected_logit = torch.sum(probs * logits, dim=-1)
     entropy = log_z - expected_logit
     return entropy
+
+def get_response_log_probs(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Computes per-token log-probabilities for the given labels and optionally the entropy.
+    """
+    # Forward pass (pass input_ids into model to get unnormalized logits)
+    # logits shape: (batch_size, sequence_length, vocab_size)
+    outputs = model(input_ids)
+    logits = outputs.logits
+
+    all_log_probs = F.log_softmax(logits, dim=-1)
+
+    gathered_log_probs = torch.gather(
+        all_log_probs,
+        dim=-1,
+        index=labels.unsqueeze(-1)
+    )
+    log_probs = gathered_log_probs.squeeze(-1)
+    result = {
+        "log_probs": log_probs
+    }
+    if return_token_entropy:
+        result["token_entropy"] = compute_entropy(logits)
+    return result
+
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    normalize_constant: float,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """
+    Sum over a dimension and normalize by a constant, considering
+    only those elements where mask == 1
+    """
+    masked_tensor = tensor * mask
+    masked_sum = torch.sum(masked_tensor, dim=dim)
+    return masked_sum / normalize_constant
+
+def sft_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant: float = 1.0,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Implement a single micro-batch update for SFT, including cross-entropy loss, summing
+    with a mask, and gradient scaling
+
+    Args:
+    policy_log_probs (batch_size, sequence_length), per-token log-probabilities from the
+    SFT policy being trained.
+    response_mask (batch_size, sequence_length), 1 for response tokens, 0 for
+    prompt/padding
+    gradient_accumulation_steps Number of microbatches per optimizer step
+    normalize_constant The constant by which to divide the sum. It is fine to leave this as 1.0
+
+    Returns:
+    tuple[torch.Tensor, dict[str, torch.Tensor]]
+    loss scalar tensor. The microbatch loss, adjusted for gradient accumulation. We return
+    this so we can log it
+    metadata Dict with metadata from the underlying loss call, and any other statistics you
+    might want to log
+    """
+    pass
