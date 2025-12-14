@@ -138,4 +138,53 @@ def log_generations(
             for step_logprobs in output.outputs[0].logprobs:
                 # extract logprobs of top-k tokens
                 # Structure is {token_id: LogprobObject(logprob=float, ...)}
-                lps = np.array([obj.logprob for ])
+                lps = np.array([obj.logprob for obj in step_logprobs.values()])
+
+                # convert to prob -> normalize -> entropy
+                probs = np.exp(lps)
+                if probs.sum() > 0:
+                    probs = probs / probs.sum()
+                    entropy = -np.sum(probs * np.log(probs + 1e-9))
+                    seq_entropies.append(entropy)
+
+        avg_entropy = statistics.mean(seq_entropies) if seq_entropies else 0.0
+        stats["entropies"].append(avg_entropy)
+
+        table_rows.append([
+            prompt[:1000], 
+            generated_text[:1000], 
+            gt, 
+            r_total, 
+            r_fmt, 
+            r_ans, 
+            length, 
+            avg_entropy
+        ])
+
+    def safe_mean(data):
+        return statistics.mean(data) if data else 0.0
+
+    metrics = {
+        "val/avg_reward": safe_mean(stats["rewards_total"]),
+        "val/avg_format_reward": safe_mean(stats["rewards_format"]),
+        "val/avg_answer_reward": safe_mean(stats["rewards_answer"]),
+        "val/avg_length": safe_mean(stats["lengths_all"]),
+        "val/avg_length_correct": safe_mean(stats["lengths_correct"]),
+        "val/avg_length_incorrect": safe_mean(stats["lengths_incorrect"]),
+        "val/avg_entropy": safe_mean(stats["entropies"]),
+    }
+
+    if wandb.run is not None:
+        cols = ["Prompt", "Response", "GT", "Total R", "Fmt R", "Ans R", "Len", "Entropy"]
+        wandb_table = wandb.Table(columns=cols, data=table_rows)
+
+        log_dict = {"val/generations": wandb_table}
+        log_dict.update(metrics)
+
+        wandb.log(log_dict, step=wandb_step if wandb_step else step)
+    
+    # Print a quick summary to console
+    print(f"Step {step} Eval: Acc={metrics['val/avg_answer_reward']:.2%}, "
+        f"Entropy={metrics['val/avg_entropy']:.2f}")
+    
+    return metrics
