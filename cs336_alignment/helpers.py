@@ -34,7 +34,7 @@ def tokenize_prompt_and_output(
     
     # Padding
     max_len = max(len(ids) for ids in full_input_ids)
-    pad_id = tokenizer.pad_id if tokenizer.pad_token_id is not None else 0
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     padded_input_ids = []
     padded_masks = []
