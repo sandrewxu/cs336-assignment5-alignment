@@ -2,6 +2,7 @@
 SFT and RL Helper Methods
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Dict, List
@@ -150,4 +151,62 @@ def sft_microbatch_train_step(
     metadata Dict with metadata from the underlying loss call, and any other statistics you
     might want to log
     """
-    pass
+    # Mask the log probs
+    masked_log_probs = policy_log_probs * response_mask
+    # Calculate loss (sum all log probs in sequence)
+    sum_log_probs = torch.sum(masked_log_probs, dim=-1)
+    # average over batch, then normalize
+    loss = -torch.mean(sum_log_probs) / normalize_constant
+
+    loss_to_optimize = loss / gradient_accumulation_steps
+
+    loss_to_optimize.backward()
+
+    metadata = {
+        "loss": loss_to_optimize.detach(),
+        "unscaled_loss": loss.detach()
+    }
+    return loss_to_optimize, metadata
+
+def log_generations(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    prompts: List[str],
+    ground_truths: List[str],
+    step: int,
+    reward_fn: Optional[callable] = None,
+    max_new_tokens: int = 128,
+    **kwargs
+) -> None:
+    """
+    descriptions
+    """
+    model.eval()
+
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+            do_sample=True,
+            temperature=0.7,
+            **kwargs
+        )
+    
+    input_len = inputs.input_ids.shape[1]
+    generated_tokens = outputs[:, input_len:]
+    responses = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+
+    rewards = []
+    correct_flags = []
+
+    if reward_fn:
+        reward_results = reward_fn(responses, ground_truths)
+        # TODO: fix!!
+
+    response_lens = [len(t) for t in generated_tokens]
+    avg_len = np.mean(response_lens)
+
+    model.train()
