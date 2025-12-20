@@ -3,9 +3,7 @@ Evaluate the zero-shot performance of a model on a dataset.
 """
 
 import json
-import os
 import typer
-from typing import List, Optional
 from vllm import LLM, SamplingParams
 
 from cs336_alignment.evaluation import evaluate_vllm
@@ -49,7 +47,6 @@ def main(
     data_path: str = "data/MATH/validation.jsonl",
     prompt_file: str = "cs336_alignment/prompts/r1_zero.prompt",
     output_file: str = "results/baseline_results.jsonl",
-    tensor_parallel_size: int = 1,
 ):
     """
     Run zero-shot MATH baseline evaluation on Qwen2.5-Math-1.5B.

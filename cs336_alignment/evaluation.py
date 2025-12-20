@@ -2,20 +2,18 @@
 Evaluation helper functions
 """
 
+from collections.abc import Callable
 import json
 import numpy as np
 import os
-import statistics
 import torch
-from typing import List, Callable, Dict, Any, Optional
 from vllm import LLM, SamplingParams
-import wandb
 
 def evaluate_vllm(
     vllm_model: LLM,
-    reward_fn: Callable[[str, str], Dict[str, float]],
-    prompts: List[str],
-    ground_truths: List[str],
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: list[str],
+    ground_truths: list[str],
     eval_sampling_params: SamplingParams,
     output_file: str,
 ) -> None:
@@ -65,126 +63,96 @@ def evaluate_vllm(
         for res in results:
             f.write(json.dumps(res) + "\n")
 
+
 def log_generations(
-    llm: LLM,
-    prompts: List[str],
-    ground_truths: List[str],
-    reward_fn: Optional[Callable[[str, str], Dict[str, float]]],
-    sampling_params: SamplingParams,
-    step: int,
-    wandb_step: Optional[int] = None,
-) -> Dict[str, float]:
+    vllm_model: LLM,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: list[str],
+    ground_truths: list[str],
+    eval_sampling_params: SamplingParams,
+    output_file: str,
+) -> None:
     """
-    Generate responses from the model for given prompts, compute rewards if a reward function
-    is provided, and log the results.
+    Given a batch of inputs with ground truths, for each input, log
+    1. the input
+    2. the response
+    3. the ground truth answer
+    4. reward information (format, answer, total)
+    5. average token entropy of the response
+    6. response length
 
-    Calculates:
-    - Rewards (total, format, answer)
-    - Response lengths (global, correct-only, incorrect-only)
-    - Approximate token entropy
+    globally, log average response length, length of correct responses,
+    and length of incorrect responses.
 
-    Logs a visual table and scalar metrics to WandB
+    Serialize to disk.
     """
+    # Modify sample_log_probs if not already
+    if eval_sampling_params.logprobs is None:
+        eval_sampling_params.logprobs = -1 # return all vocab_size logprobs
 
-    # Prepare sampling params
-    eval_params = sampling_params.clone()
-    if eval_params.logprobs is None:
-        eval_params.logprobs = 10
-    
-    print(f"DEBUG: Generating {len(prompts)} validation samples at step {step}...")
-    outputs = llm.generate(prompts, eval_params)
+    # Generate text
+    outputs = vllm_model.generate(prompts, eval_sampling_params)
 
-    table_rows = []
-    
-    stats = {
-        "rewards_total": [],
-        "rewards_format": [],
-        "rewards_answer": [],
-        "lengths_all": [],
-        "lengths_correct": [],
-        "lengths_incorrect": [],
-        "entropies": []
+    # Compute rewards
+    results = []
+    total_metrics = {
+        "response_length": 0,
+        "response_length_correct": 0,
+        "response_length_incorrect": 0,
+        "num_correct": 0,
     }
 
     for i, output in enumerate(outputs):
-        prompt = prompts[i]
-        gt = ground_truths[i]
-
         generated_text = output.outputs[0].text
-        token_ids = output.outputs[0].token_ids
+        metrics = reward_fn(generated_text, ground_truths[i])
+        response_length = len(output.outputs[0].token_ids)
+        logprobs = output.outputs[0].logprobs # list[dict[int, Logprob]]
+        if logprobs is not None:
+            lp_matrix = np.array([
+                [lp.logprob for lp in step_logprobs.values()]
+                for step_logprobs in logprobs
+            ]) # Shape: (len(output), vocab_size)
+            entropies = -np.sum(np.exp(lp_matrix) * lp_matrix, axis=-1) # (len_output)
+            avg_token_entropy = np.mean(entropies)
 
-        # Rewards
-        metrics = reward_fn(generated_text, gt)
-        r_total = metrics["reward"]
-        r_fmt = metrics["format_reward"]
-        r_ans = metrics["answer_reward"]
-        stats["rewards_total"].append(r_total)
-        stats["rewards_format"].append(r_fmt)
-        stats["rewards_answer"].append(r_ans)
+        entry = {
+            "prompt": prompts[i],
+            "generated_text": generated_text,
+            "ground_truth": ground_truths[i],
+            **metrics,
+            "average_token_entropy": avg_token_entropy if logprobs else None,
+            "response_length": response_length,
+        }
 
-        # Answer lengths
-        length = len(token_ids)
-        stats["lengths_all"].append(length)
+        results.append(entry)
 
-        if r_ans == 1.0:
-            stats["lengths_correct"].append(length)
+        total_metrics["response_length"] += response_length
+        if metrics["reward"] == 1.0:
+            total_metrics["response_length_correct"] += response_length
+            total_metrics["num_correct"] += 1.0
         else:
-            stats["lengths_incorrect"].append(length)
+            total_metrics["response_length_incorrect"] += response_length
 
-        # Entropy
-        # vLLM returns a list of dicts: [{token_id: logprob, ...}, ...] per step
-        seq_entropies = []
-        if output.outputs[0].logprobs:
-            for step_logprobs in output.outputs[0].logprobs:
-                # extract logprobs of top-k tokens
-                # Structure is {token_id: LogprobObject(logprob=float, ...)}
-                lps = np.array([obj.logprob for obj in step_logprobs.values()])
-
-                # convert to prob -> normalize -> entropy
-                probs = np.exp(lps)
-                if probs.sum() > 0:
-                    probs = probs / probs.sum()
-                    entropy = -np.sum(probs * np.log(probs + 1e-9))
-                    seq_entropies.append(entropy)
-
-        avg_entropy = statistics.mean(seq_entropies) if seq_entropies else 0.0
-        stats["entropies"].append(avg_entropy)
-
-        table_rows.append([
-            prompt[:1000], 
-            generated_text[:1000], 
-            gt, 
-            r_total, 
-            r_fmt, 
-            r_ans, 
-            length, 
-            avg_entropy
-        ])
-
-    def safe_mean(data):
-        return statistics.mean(data) if data else 0.0
-
-    metrics = {
-        "val/avg_reward": safe_mean(stats["rewards_total"]),
-        "val/avg_format_reward": safe_mean(stats["rewards_format"]),
-        "val/avg_answer_reward": safe_mean(stats["rewards_answer"]),
-        "val/avg_length": safe_mean(stats["lengths_all"]),
-        "val/avg_length_correct": safe_mean(stats["lengths_correct"]),
-        "val/avg_length_incorrect": safe_mean(stats["lengths_incorrect"]),
-        "val/avg_entropy": safe_mean(stats["entropies"]),
+    # Calculate averages
+    num_examples = len(results)
+    num_correct = total_metrics["num_correct"]
+    num_incorrect = num_examples - num_correct
+    avg_metrics = {
+        "avg_response_length": total_metrics["response_length"] / num_examples,
+        "avg_response_length_correct": total_metrics["response_length_correct"] / num_correct if num_correct > 0 else 0,
+        "avg_response_length_incorrect": total_metrics["response_length_incorrect"] / num_incorrect if num_incorrect > 0 else 0,
+        "accuracy": total_metrics["num_correct"] / num_examples,
     }
 
-    if wandb.run is not None:
-        cols = ["Prompt", "Response", "GT", "Total R", "Fmt R", "Ans R", "Len", "Entropy"]
-        wandb_table = wandb.Table(columns=cols, data=table_rows)
+    # Print summary
+    print("-" * 40)
+    print(f"Evaluation complete on {num_examples} examples.")
+    for k, v in avg_metrics.items():
+        print(f"{k}: {v:.4f}")
+    print("-" * 40)
 
-        log_dict = {"val/generations": wandb_table}
-        log_dict.update(metrics)
-
-        wandb.log(log_dict, step=wandb_step if wandb_step else step)
-    
-    # Print a quick summary to console
-    print(f"Step {step} Eval: Acc={metrics['val/avg_answer_reward']:.2%}, "
-        f"Entropy={metrics['val/avg_entropy']:.2f}")
-    
-    return metrics
+    # Serialize to disk
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w") as f:
+        for res in results:
+            f.write(json.dumps(res) + "\n")
