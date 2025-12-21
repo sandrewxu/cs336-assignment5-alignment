@@ -76,7 +76,7 @@ def log_generations(
     ground_truths: list[str],
     eval_sampling_params: SamplingParams,
     output_file: str,
-) -> None:
+):
     """
     Given a batch of inputs with ground truths, for each input, log
     1. the input
@@ -105,38 +105,41 @@ def log_generations(
         "response_length_correct": 0,
         "response_length_incorrect": 0,
         "num_correct": 0,
+        "token_entropy": 0.0,
     }
 
     for i, output in enumerate(outputs):
-        generated_text = output.outputs[0].text
-        metrics = reward_fn(generated_text, ground_truths[i])
-        response_length = len(output.outputs[0].token_ids)
-        logprobs = output.outputs[0].logprobs # list[dict[int, Logprob]]
-        if logprobs is not None:
-            lp_matrix = np.array([
-                [lp.logprob for lp in step_logprobs.values()]
-                for step_logprobs in logprobs
-            ]) # Shape: (len(output), vocab_size)
-            entropies = -np.sum(np.exp(lp_matrix) * lp_matrix, axis=-1) # (len_output)
-            avg_token_entropy = np.mean(entropies)
+        for completion in output.outputs:
+            generated_text = completion.text
+            metrics = reward_fn(generated_text, ground_truths[i])
+            response_length = len(completion.token_ids)
+            logprobs = completion.logprobs # list[dict[int, Logprob]]
+            if logprobs is not None:
+                lp_matrix = np.array([
+                    [lp.logprob for lp in step_logprobs.values()]
+                    for step_logprobs in logprobs
+                ]) # Shape: (len(output), vocab_size)
+                entropies = -np.sum(np.exp(lp_matrix) * lp_matrix, axis=-1) # (len_output)
+                avg_token_entropy = np.mean(entropies)
 
-        entry = {
-            "prompt": prompts[i],
-            "generated_text": generated_text,
-            "ground_truth": ground_truths[i],
-            **metrics,
-            "average_token_entropy": avg_token_entropy if logprobs else None,
-            "response_length": response_length,
-        }
+            entry = {
+                "prompt": prompts[i],
+                "generated_text": generated_text,
+                "ground_truth": ground_truths[i],
+                **metrics,
+                "average_token_entropy": avg_token_entropy if logprobs else None,
+                "response_length": response_length,
+            }
 
-        results.append(entry)
+            results.append(entry)
 
-        total_metrics["response_length"] += response_length
-        if metrics["reward"] == 1.0:
-            total_metrics["response_length_correct"] += response_length
-            total_metrics["num_correct"] += 1.0
-        else:
-            total_metrics["response_length_incorrect"] += response_length
+            total_metrics["response_length"] += response_length
+            total_metrics["token_entropy"] += avg_token_entropy if logprobs else 0.0
+            if metrics["reward"] == 1.0:
+                total_metrics["response_length_correct"] += response_length
+                total_metrics["num_correct"] += 1.0
+            else:
+                total_metrics["response_length_incorrect"] += response_length
 
     # Calculate averages
     num_examples = len(results)
@@ -147,7 +150,9 @@ def log_generations(
         "avg_response_length_correct": total_metrics["response_length_correct"] / num_correct if num_correct > 0 else 0,
         "avg_response_length_incorrect": total_metrics["response_length_incorrect"] / num_incorrect if num_incorrect > 0 else 0,
         "accuracy": total_metrics["num_correct"] / num_examples,
+        "avg_token_entropy": total_metrics["token_entropy"] / num_examples,
     }
+    results.append(avg_metrics)
 
     # Print summary
     print("-" * 40)
@@ -161,6 +166,8 @@ def log_generations(
     with open(output_file, "w") as f:
         for res in results:
             f.write(json.dumps(res) + "\n")
+
+    return results
 
 def init_vllm(
     model_id: str,

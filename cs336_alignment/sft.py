@@ -59,6 +59,7 @@ def train_sft(
     prompt_strs: list[str],
     output_strs: list[str],
     train_batch_size: int = 64,
+    epochs: int = 1,
     gradient_accumulation_steps: int = 32,
     device: torch.device = None,
     output_dir: str = None,
@@ -74,8 +75,7 @@ def train_sft(
     # Initialize step counter
     global_step = 0
     batch_loss = 0.0
-
-    data_loader = batch_generator(prompt_strs, output_strs, tokenizer, microbatch_size, device)
+    data_loader = batch_generator(prompt_strs, output_strs, tokenizer, epochs, microbatch_size, device)
 
     for idx, (inputs, labels, response_mask) in enumerate(data_loader):
         policy_log_probs = get_response_log_probs(model, inputs, labels)["log_probs"]

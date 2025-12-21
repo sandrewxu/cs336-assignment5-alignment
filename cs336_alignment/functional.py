@@ -143,6 +143,7 @@ def batch_generator(
     prompts: list[str],
     outputs: list[str],
     tokenizer: PreTrainedTokenizer,
+    epochs: int,
     batch_size: int,
     device: torch.device,
 ):
@@ -150,11 +151,12 @@ def batch_generator(
     Generator function to generate batches of 
     prompt, output, and masks for training
     """
-    num_batches = len(prompts) // batch_size
-    for i in range(0, len(prompts), batch_size):
+    new_prompts = prompts * epochs
+    new_outputs = outputs * epochs
+    for i in range(0, len(new_prompts), batch_size):
         batch = tokenize_prompt_and_output(
-            prompts[i : i + batch_size],
-            outputs[i : i + batch_size],
+            new_prompts[i : i + batch_size],
+            new_outputs[i : i + batch_size],
             tokenizer,
         )
 
