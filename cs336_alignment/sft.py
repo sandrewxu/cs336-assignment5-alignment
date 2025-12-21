@@ -4,6 +4,7 @@ SFT-specific functions
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
+import wandb
 from cs336_alignment.functional import (
     batch_generator,
     get_response_log_probs,
@@ -68,18 +69,23 @@ def train_sft(
     Save to output_dir after finished.
     """
     microbatch_size = train_batch_size // gradient_accumulation_steps
-    num_batches = len(prompt_strs) // microbatch_size
     model.train()
+
+    # Initialize step counter
+    global_step = 0
+    batch_loss = 0.0
 
     data_loader = batch_generator(prompt_strs, output_strs, tokenizer, microbatch_size, device)
 
     for idx, (inputs, labels, response_mask) in enumerate(data_loader):
         policy_log_probs = get_response_log_probs(model, inputs, labels)["log_probs"]
-        loss, metadata = sft_microbatch_train_step(
+        loss, _ = sft_microbatch_train_step(
             policy_log_probs,
             response_mask,
             gradient_accumulation_steps,
         )
+
+        batch_loss += loss
 
         if (idx + 1) % gradient_accumulation_steps == 0:
             # clip gradients at `max_gradient`
@@ -87,6 +93,16 @@ def train_sft(
             # update weights and zero gradients every `gradient_accumulation_steps` batches
             optimizer.step()
             optimizer.zero_grad()
+
+            global_step += 1
+
+            if wandb.run is not None:
+                wandb.log({
+                    "train/loss": batch_loss,
+                    "train/step": global_step,
+                })
+            
+            batch_loss = 0
 
     # Save to output dir
     model.save_pretrained(save_directory=output_dir)
