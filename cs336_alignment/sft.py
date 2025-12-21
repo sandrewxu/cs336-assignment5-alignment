@@ -34,20 +34,22 @@ def sft_microbatch_train_step(
         metadata Dict with metadata from the underlying loss call, and any other statistics you
             might want to log
     """
-    raw_loss = -masked_normalize(
+    sequence_losses = -masked_normalize(
         policy_log_probs,
         response_mask,
         normalize_constant,
         dim=-1,
-    )
+    ) # sum over sequences
+    # mean over batches
+    raw_loss = torch.mean(sequence_losses)
     scaled_loss = raw_loss / gradient_accumulation_steps
     scaled_loss.backward()
 
     metadata = {
-        "unscaled loss": raw_loss.item(),
+        "unscaled loss": raw_loss.detach(),
         "gradient accumulation steps": gradient_accumulation_steps,
     }
-    return scaled_loss.item(), metadata
+    return scaled_loss.detach(), metadata
 
 def train_sft(
     model: PreTrainedModel,
