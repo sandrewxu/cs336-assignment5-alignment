@@ -101,8 +101,22 @@ def train_sft(
                     "train/loss": batch_loss,
                     "train/step": global_step,
                 })
-            
+
             batch_loss = 0
+
+    if (idx + 1) % gradient_accumulation_steps != 0:
+        # clip gradients at `max_gradient`
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_gradient)
+        # update weights and zero gradients every `gradient_accumulation_steps` batches
+        optimizer.step()
+        optimizer.zero_grad()
+
+        global_step += 1
+        if wandb.run is not None:
+            wandb.log({
+                "train/loss": batch_loss,
+                "train/step": global_step,
+            })
 
     # Save to output dir
     model.save_pretrained(save_directory=output_dir)

@@ -10,6 +10,7 @@ import torch
 from transformers import PreTrainedModel
 from unittest.mock import patch
 from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
 def evaluate_vllm(
     vllm_model: LLM,
@@ -18,7 +19,7 @@ def evaluate_vllm(
     ground_truths: list[str],
     eval_sampling_params: SamplingParams,
     output_file: str,
-) -> None:
+) -> dict[str, float]:
     """
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
@@ -64,6 +65,8 @@ def evaluate_vllm(
     with open(output_file, "w") as f:
         for res in results:
             f.write(json.dumps(res) + "\n")
+
+    return avg_metrics
 
 
 def log_generations(

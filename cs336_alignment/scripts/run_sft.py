@@ -80,7 +80,9 @@ def main(
     print(f"Output directory: {output_dir}")
 
     wandb.init(
-        project="cs336-a5-sft",
+        entity="andrew-xu",
+        project="cs336-a5",
+        name=run_name,
         config={
             "model_path": model_path,
             "sft_examples": sft_examples if sft_examples else "full",
@@ -112,6 +114,8 @@ def main(
         filter_correct
     )
 
+    print(f"Loaded {len(prompts)} training examples.")
+
     # Train
     train_sft(
         model,
@@ -120,7 +124,7 @@ def main(
         prompt_strs = prompts,
         output_strs = outputs,
         train_batch_size = batch_size,
-        gradient_accumulation_steps = batch_size/2,
+        gradient_accumulation_steps = batch_size // 2,
         device=device_obj,
         output_dir = output_dir,
     )
@@ -154,7 +158,7 @@ def main(
             include_stop_str_in_output=True
         )
 
-        evaluate_vllm(
+        metrics = evaluate_vllm(
             vllm_model=llm,
             reward_fn=r1_zero_reward_fn,
             prompts=eval_prompts,
@@ -163,6 +167,10 @@ def main(
             output_file=eval_output_file,
         )
 
+        wandb.log({
+            "eval/format_reward": metrics.get("format_reward", 0.0),
+            "eval/reward": metrics.get("reward", 0.0)
+        })
     wandb.finish()
 
 if __name__ == "__main__":

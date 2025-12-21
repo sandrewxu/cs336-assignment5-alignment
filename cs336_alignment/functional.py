@@ -151,13 +151,10 @@ def batch_generator(
     prompt, output, and masks for training
     """
     num_batches = len(prompts) // batch_size
-    for i in range(num_batches):
-        start = i * batch_size
-        end = start + batch_size
-
+    for i in range(0, len(prompts), batch_size):
         batch = tokenize_prompt_and_output(
-            prompts[start:end],
-            outputs[start:end],
+            prompts[i : i + batch_size],
+            outputs[i : i + batch_size],
             tokenizer,
         )
 
