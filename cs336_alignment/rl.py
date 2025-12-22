@@ -134,16 +134,18 @@ def compute_policy_gradient_loss(
     Wrapper that delegates to the appropriate policy gradient loss function above.
     """
     if loss_type == "grpo_clip":
-        assert cliprange
-        assert advantages
-        assert old_log_probs
+        assert cliprange is not None
+        assert advantages is not None
+        assert old_log_probs is not None
         loss, metadata = compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
     elif loss_type == "no_baseline":
-        assert raw_rewards
-        loss, metadata = compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+        assert raw_rewards is not None
+        loss = compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+        metadata = {}
     else:
-        assert advantages
-        loss, metadata = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+        assert advantages is not None
+        loss = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+        metadata = {}
 
     return loss, metadata
 
@@ -167,7 +169,10 @@ def masked_mean(
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    return torch.mean(tensor * mask, dim=dim)
+    masked_sum = torch.sum(tensor * mask, dim=dim)
+    mask_count = torch.sum(mask, dim=dim)
+    result = masked_sum / mask_count
+    return result
 
 def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
@@ -214,7 +219,7 @@ def grpo_microbatch_train_step(
         old_log_probs,
         cliprange
     )
-    sequence_losses = -masked_mean(loss, response_mask, dim=-1)
+    sequence_losses = masked_mean(loss, response_mask, dim=-1)
     raw_loss = torch.mean(sequence_losses)
     scaled_loss = raw_loss / gradient_accumulation_steps
     scaled_loss.backward()

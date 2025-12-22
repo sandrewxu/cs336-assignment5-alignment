@@ -276,7 +276,7 @@ def run_grpo_microbatch_train_step(
             the policy gradient loss and its metadata.
     """
     from cs336_alignment.rl import grpo_microbatch_train_step
-    grpo_microbatch_train_step(
+    return grpo_microbatch_train_step(
         policy_log_probs,
         response_mask,
         gradient_accumulation_steps,
