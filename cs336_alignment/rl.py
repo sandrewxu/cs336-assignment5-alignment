@@ -3,8 +3,13 @@ Methods for RL
 """
 
 import torch
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, PreTrainedTokenizer
 from typing import Callable, Literal, Optional
+from vllm import LLM, SamplingParams
+import wandb
+
+from cs336_alignment.evaluation import load_policy_into_vllm_instance
+from cs336_alignment.functional import tokenize_prompt_and_output, get_response_log_probs
 
 def compute_group_normalized_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -229,6 +234,11 @@ def grpo_microbatch_train_step(
 
 def train_grpo(
     policy: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    vllm_model: LLM,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    prompts: list[str],
+    ground_truths: list[str],
     n_grpo_steps: int = 200,
     learning_rate: float = 1e-5,
     advantage_eps: float = 1e-6,
@@ -243,27 +253,184 @@ def train_grpo(
     gpu_memory_utilization: float = 0.85,
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = "reinforce_with_baseline",
     use_std_normalization: bool = True,
-    optimizer: torch.optim = None,
+    cliprange: float = 0.2,
+    max_gradient: float = 1.0,
+    rl_device: str = "cuda:0",
+    vllm_device: str = "cuda:1",
+    eval_prompts: list[str] = None,
+    eval_ground_truths: list[str] = None,
+    eval_interval: int = 10,
 ) -> None:
     """
+    GRPO training loop.
+
+    # TODO: add more details.
     """
-    assert train_batch_size % gradient_accumulation_steps == 0, (
-        "train_batch_size must be divisible by gradient_accumulation_steps"
-    )
+    # Validate batch sizes
+    assert train_batch_size % gradient_accumulation_steps == 0
     micro_train_batch_size = train_batch_size // gradient_accumulation_steps
-    assert rollout_batch_size % group_size == 0, (
-        "rollout_batch_size must be divisible by group_size"
-    )
+    assert rollout_batch_size % group_size == 0
     n_prompts_per_rollout_batch = rollout_batch_size // group_size
-    assert train_batch_size >= group_size, (
-        "train_batch_size must be greater than or equal to group_size"
+    assert train_batch_size >= group_size
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=learning_rate,
+        weight_decay=0.0,
+        betas=(0.9, 0.95),
     )
-    n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(
-            policy.parameters(),
-            lr=learning_rate,
-            weight_decay=0.0,
-            betas=(0.9, 0.95),
+
+    # Sampling params for vLLM
+    sampling_params = SamplingParams(
+        n=group_size,
+        temperature=sampling_temperature,
+        top_p=1.0,
+        min_tokens=sampling_min_tokens,
+        max_tokens=sampling_max_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+
+    # Track prompt index for cycling
+    prompt_idx = 0
+
+    for step in range(n_grpo_steps):
+        print(f"=== GRPO Step {step + 1}/{n_grpo_steps} ===")
+
+        # Sample batch of questions D_b
+        batch_prompts = []
+        batch_ground_truths = []
+        end_idx = prompt_idx + n_prompts_per_rollout_batch
+        if end_idx >= len(prompts):
+            batch_prompts.append(prompts[prompt_idx:])
+            batch_ground_truths.append(ground_truths[prompt_idx:])
+            # need `end_idx - len(prompts) + 1` more items
+            prompt_idx = end_idx - len(prompts) + 1
+            batch_prompts.append(prompts[:prompt_idx])
+            batch_ground_truths.append(ground_truths[:prompt_idx])
+        else:
+            batch_prompts.append(prompts[prompt_idx:end_idx])
+            batch_ground_truths.append(ground_truths[prompt_idx:end_idx])
+            prompt_idx = end_idx
+
+        # Sync policy weights to vLLM
+        load_policy_into_vllm_instance(policy, vllm_model)
+
+        # Sample G outputs per question, flatten rollouts (n_prompts * group_size,)
+        outputs = vllm_model.generate(batch_prompts, sampling_params)
+        rollout_responses = []
+        repeated_prompts = []
+        repeated_ground_truths = []
+        for i, output in enumerate(outputs):
+            for completion in output.outputs:
+                rollout_responses.append(completion.text)
+                repeated_prompts.append(batch_prompts[i])
+                repeated_ground_truths.append(batch_ground_truths[i])
+
+        # Compute rewards & advantages
+        advantages, raw_rewards, reward_metadata = compute_group_normalized_rewards(
+            reward_fn=reward_fn,
+            rollout_responses=rollout_responses,
+            repeated_ground_truths=repeated_ground_truths,
+            group_size=group_size,
+            advantage_eps=advantage_eps,
+            normalize_by_std=use_std_normalization,
         )
-    
+
+        # Log reward stats
+        print(f"  Mean reward: {raw_reward}")
+        if wandb.run is not None:
+            wandb.log({
+                "train/reward_mean": None,
+                "train/reward_max": None,
+                "train/reward_min": None,
+                "train/step": step + 1,
+            })
+
+        # Tokenize all rollouts
+        tokenized = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
+        input_ids = tokenized["input_ids"].to(rl_device)
+        labels = tokenized["labels"].to(rl_device)
+        response_mask = tokenized["response_mask"].to(rl_device)
+        advantages = advantages.to(rl_device)
+        raw_rewards = raw_rewards.to(rl_device)
+
+        # Compute old log probs once (for GRPO-Clip)
+        if loss_type == "grpo_clip":
+            policy.eval()
+            with torch.no_grad():
+                old_log_probs_result = get_response_log_probs(policy, input_ids, labels)
+                old_log_probs = old_log_probs_result["log_probs"]
+            policy.train()
+        else:
+            old_log_probs = None
+
+        # Inner training loop
+        n_train_steps = epochs_per_rollout_batch * (rollout_batch_size // train_batch_size)
+
+        for epoch in range(epochs_per_rollout_batch):
+            # Shuffle indices for this epoch
+            perm = torch.randomperm(rollout_batch_size)
+
+            for micro_step in range(0, rollout_batch_size, micro_train_batch_size):
+                # Get microbatch data
+                idx = perm[micro_step : micro_step + micro_train_batch_size]
+                mb_input_ids = input_ids[idx]
+                mb_labels = labels[idx]
+                mb_response_mask = response_mask[idx]
+                mb_advantages = advantages[idx]
+                mb_raw_rewards = raw_rewards[idx]
+                mb_old_log_probs = old_log_probs[idx] if old_log_probs is not None else None
+
+                # Forward pass for current policy log probs
+                policy_log_probs = get_response_log_probs(
+                    policy, mb_input_ids, mb_labels, return_token_entropy=True
+                )
+
+                # Compute loss and backward
+                loss, metadata = grpo_microbatch_train_step(
+                    policy_log_probs=policy_log_probs,
+                    response_mask=mb_response_mask,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    loss_type=loss_type,
+                    raw_rewards=mb_raw_rewards,
+                    advantages=mb_advantages,
+                    old_log_probs=mb_old_log_probs,
+                    cliprange=cliprange,
+                )
+
+                if (micro_step // micro_train_batch_size + 1) % gradient_accumulation_steps == 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        policy.parameters(), max_norm=max_gradient
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    if wandb.run is not None:
+                        log_dict = {
+                            "train/loss": metadata["unscaled_loss"].item(),
+                            "train/grad_norm": grad_norm.item(),
+                        }
+                        if "clip_fraction" in metadata:
+                            log_dict["train/clip_fraction"] = metadata["clip_fraction"].item()
+                        wandb.log(log_dict)
+
+        if eval_prompts is not None and (step + 1) % eval_interval == 0:
+            evaluate_and_log(policy, vllm_model, reward_fn, eval_prompts, eval_ground_truths, step + 1)
+
+"""
+And here are a few additional tips:
+• Remember to use the r1_zero prompt, and direct vLLM to stop generation at the second answer tag
+</answer>, as in the previous experiments.
+• We suggest using typer for argument parsing.
+• You should routinely log validation rewards (e.g., every 5 or 10 steps). You should evaluate on at least
+1024 validation examples to compare hyperparameters, as CoT/RL evaluations can be noisy.
+• You should log some or all of the following for each optimizer update:
+– Token entropy.
+– Train rewards (total, format, and answer).
+
+FIX WANDB LOGGING
+
+GET THE METRICS THING
+"""
