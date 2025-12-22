@@ -92,8 +92,8 @@ def log_generations(
     Serialize to disk.
     """
     # Modify sample_log_probs if not already
-    if eval_sampling_params.logprobs is None:
-        eval_sampling_params.logprobs = -1 # return all vocab_size logprobs
+    # if eval_sampling_params.logprobs is None:
+    #     eval_sampling_params.logprobs = -1 # return all vocab_size logprobs
 
     # Generate text
     outputs = vllm_model.generate(prompts, eval_sampling_params)

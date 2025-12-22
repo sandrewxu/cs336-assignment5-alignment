@@ -2,13 +2,12 @@
 Use Expert Iteration (EI) to finetune a model on a dataset.
 """
 
-from collections.abc import Callable
-import json
 import math
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import typer
+from typing import Optional
 from vllm import SamplingParams
 import wandb
 
@@ -20,10 +19,9 @@ from cs336_alignment.scripts.run_sft import load_prompts_and_outputs
 
 app = typer.Typer()
 
-app.command()
+@app.command()
 def main(
     model_path: str = "Qwen/Qwen2.5-Math-1.5B",
-    reward_fn: Callable[[str, str], dict[str, float]] = r1_zero_reward_fn,
     train_data_path: str = "data/MATH/train.jsonl",
     eval_data_path = "data/MATH/validation.jsonl",
     prompt_file = "cs336_alignment/prompts/r1_zero.prompt",
@@ -32,7 +30,8 @@ def main(
     ei_batch_size: int = 512,
     sft_epochs: int = 1,
     sft_batch_size: int = 64,
-    learning_rate: float = 1e-5,
+    learning_rate: float = 1e-4,
+    logprobs: Optional[int] = None,
     output_dir_base: str = "/gpfs/radev/home/ax46/scratch/A5/ei",
     sft_device: str = "cuda:0",
     vllm_device: str = "cuda:1",
@@ -48,7 +47,7 @@ def main(
 
     wandb.init(
         entity="andrew-xu",
-        project="cs336-a5",
+        project="cs336-a5-ei",
         name=run_name,
         config={
             "model_path": model_path,
@@ -97,40 +96,24 @@ def main(
         n=G,
         temperature=1.0,
         top_p=1.0,
+        min_tokens=4,
         max_tokens=1024,
-        logprobs = -1,
+        logprobs=logprobs,
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
 
     for i in range(n_ei_steps):
         print(f"=== Starting Iteration {i+1}/{n_ei_steps} ===")
-        # Set old policy model
         print("Syncing policy weights to vLLM...")
         load_policy_into_vllm_instance(model, llm)
-
-        # Evaluate against validation set
-        eval_output_file = f"results/ei/{run_name}/eval/iter_{i}.jsonl"
-        metrics = evaluate_vllm(
-            vllm_model=llm,
-            reward_fn=reward_fn,
-            prompts=eval_prompts,
-            ground_truths=eval_ground_truths,
-            eval_sampling_params=eval_sampling_params,
-            output_file=eval_output_file,
-        )
-        wandb.log({
-            "eval/format_reward": metrics.get("format_reward", 0.0),
-            "eval/reward": metrics.get("reward", 0.0),
-            "eval/step": i
-        })
-
         # Generate training data (G rollouts)
         start = i * ei_batch_size
         end = start + ei_batch_size
         batch_prompts = full_train_prompts[start:end]
         batch_gts = full_train_ground_truths[start:end]
-        train_output_file = f"results/ei/{run_name}/train/iter_{i}.jsonl"
+        train_output_file = f"results/ei/{run_name}/train/iter_{i+1}.jsonl"
+        print(f"Logging generations for {len(batch_prompts)} prompts")
 
         generation_results = log_generations(
             llm,
@@ -148,7 +131,7 @@ def main(
             "ei/avg_response_length_incorrect": gen_stats["avg_response_length_incorrect"],
             "ei/accuracy": gen_stats["accuracy"],
             "ei/avg_token_entropy": gen_stats["avg_token_entropy"],
-            "ei/step": i,
+            "ei/step": i+1,
         })
 
         sft_prompts = []
@@ -165,7 +148,7 @@ def main(
             print(f"Loaded {len(sft_prompts)} training examples.")
 
         # Train SFT (updates model in-place)
-        iter_output_dir = os.path.join(global_output_dir, f"iter_{i}")
+        iter_output_dir = os.path.join(global_output_dir, f"iter_{i+1}")
         os.makedirs(iter_output_dir, exist_ok=True)
 
         optimizer = torch.optim.AdamW(
@@ -189,7 +172,7 @@ def main(
         )
 
     # Evaluate against validation set
-    eval_output_file = f"results/ei/{run_name}/eval/iter_{n_ei_steps}.jsonl"
+    eval_output_file = f"results/ei/{run_name}/eval.jsonl"
     metrics = evaluate_vllm(
         vllm_model=llm,
         reward_fn=r1_zero_reward_fn,
@@ -201,7 +184,6 @@ def main(
     wandb.log({
         "eval/format_reward": metrics.get("format_reward", 0.0),
         "eval/reward": metrics.get("reward", 0.0),
-        "eval/step": n_ei_steps
     })
 
 if __name__ == "__main__":

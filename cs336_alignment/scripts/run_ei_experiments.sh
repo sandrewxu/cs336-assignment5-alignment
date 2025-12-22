@@ -24,21 +24,24 @@ echo "Outputting experiments to: $OUTPUT_BASE"
 # ==========================================
 # Goal: Find the best configuration for rollouts and epochs.
 # "Vary the number of rollouts G per question and the number of epochs used in the SFT step"
-# We fix ei_batch_size = 512 for these tuning runs.
+# We fix ei_batch_size = 128 for these tuning runs.
 
 echo "--- Starting Hyperparameter Tuning (G and SFT Epochs) ---"
 
-for G in 32 64 128; do
-    for E in 1 3 5; do
-    echo "Tuning Run: G=$G, Epochs=$E"
-    uv run cs336_alignment/scripts/run_ei.py \
-        --train-data-path "$DATA_PATH" \
-        --eval-data-path "$EVAL_PATH" \
-        --g $G \
-        --sft-epochs $E \
-        --ei-batch-size 512 \
-        --output-dir-base "$OUTPUT_BASE"
+for G in 4; do
+    for E in 1 3; do
+        echo "Tuning Run: G=$G, Epochs=$E"
+        uv run cs336_alignment/scripts/run_ei.py \
+            --train-data-path "$DATA_PATH" \
+            --eval-data-path "$EVAL_PATH" \
+            --g $G \
+            --sft-epochs $E \
+            --ei-batch-size 128 \
+            --output-dir-base "$OUTPUT_BASE"
+    done
 done
+
+echo "EI tuning experiments completed."
 
 # ==========================================
 # SET YOUR BEST HYPERPARAMETERS HERE
