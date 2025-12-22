@@ -110,9 +110,9 @@ def main(
         loss_type=loss_type,
         use_std_normalization=use_std_normalization,
         cliprange=cliprange,
-        device=device,
-        eval_prompts=eval_prompts,
-        eval_ground_truths=eval_ground_truths,
+        rl_device=device,
+        eval_prompts=eval_prompts[:1024],
+        eval_ground_truths=eval_ground_truths[:1024],
         eval_interval=eval_interval,
     )
 

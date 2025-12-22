@@ -115,10 +115,10 @@ def compute_grpo_clip_loss(
 
     loss = -torch.min(surr1, surr2)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         clip_matrix = (surr2 < surr1)
         clip_fraction = clip_matrix.float().mean()
-    
+
     metadata = {
         "clip_matrix": clip_matrix.detach(),
         "clip_fraction": clip_fraction,
@@ -315,15 +315,15 @@ def train_grpo(
         batch_ground_truths = []
         end_idx = prompt_idx + n_prompts_per_rollout_batch
         if end_idx >= len(prompts):
-            batch_prompts.append(prompts[prompt_idx:])
-            batch_ground_truths.append(ground_truths[prompt_idx:])
+            batch_prompts.extend(prompts[prompt_idx:])
+            batch_ground_truths.extend(ground_truths[prompt_idx:])
             # need `end_idx - len(prompts) + 1` more items
             prompt_idx = end_idx - len(prompts) + 1
-            batch_prompts.append(prompts[:prompt_idx])
-            batch_ground_truths.append(ground_truths[:prompt_idx])
+            batch_prompts.extend(prompts[:prompt_idx])
+            batch_ground_truths.extend(ground_truths[:prompt_idx])
         else:
-            batch_prompts.append(prompts[prompt_idx:end_idx])
-            batch_ground_truths.append(ground_truths[prompt_idx:end_idx])
+            batch_prompts.extend(prompts[prompt_idx:end_idx])
+            batch_ground_truths.extend(ground_truths[prompt_idx:end_idx])
             prompt_idx = end_idx
 
         # Sync policy weights to vLLM
@@ -349,6 +349,8 @@ def train_grpo(
             advantage_eps=advantage_eps,
             normalize_by_std=use_std_normalization,
         )
+        advantages = advantages.unsqueeze(1) # (..., 1)
+        raw_rewards = raw_rewards.unsqueeze(1) # (..., 1)
 
         # Log reward stats
         print(f"  Mean reward: {reward_metadata["mean"]}")
@@ -372,7 +374,7 @@ def train_grpo(
         # Compute old log probs once (for GRPO-Clip)
         if loss_type == "grpo_clip":
             policy.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 old_log_probs_result = get_response_log_probs(policy, input_ids, labels)
                 old_log_probs = old_log_probs_result["log_probs"]
             policy.train()
@@ -382,7 +384,7 @@ def train_grpo(
         # Inner training loop
         for _ in range(epochs_per_rollout_batch):
             # Shuffle indices for this epoch
-            perm = torch.randomperm(rollout_batch_size)
+            perm = torch.randperm(rollout_batch_size)
 
             for micro_step in range(0, rollout_batch_size, micro_train_batch_size):
                 # Get microbatch data
@@ -395,9 +397,10 @@ def train_grpo(
                 mb_old_log_probs = old_log_probs[idx] if old_log_probs is not None else None
 
                 # Forward pass for current policy log probs
-                policy_log_probs = get_response_log_probs(
+                policy_log_probs_result = get_response_log_probs(
                     policy, mb_input_ids, mb_labels, return_token_entropy=True
                 )
+                policy_log_probs = policy_log_probs_result["log_probs"]
 
                 # Compute loss and backward
                 _, metadata = grpo_microbatch_train_step(
@@ -422,19 +425,20 @@ def train_grpo(
                         log_dict = {
                             "train/loss": metadata["unscaled_loss"].item(),
                             "train/grad_norm": grad_norm.item(),
-                            "train/avg_token_entropy": policy_log_probs["token_entropy"].mean(),
+                            "train/avg_token_entropy": policy_log_probs_result["token_entropy"].mean(),
+                            "train/step": micro_step // micro_train_batch_size + 1,
                         }
                         if "clip_fraction" in metadata:
                             log_dict["train/clip_fraction"] = metadata["clip_fraction"].item()
                         wandb.log(log_dict)
 
-        if eval_prompts is not None and (step + 1) % eval_interval == 0:
+        if eval_prompts is not None and (step + 1) % eval_interval == 0 and (step + 1) < n_grpo_steps:
             evaluate_and_log(policy, vllm_model, reward_fn, eval_prompts, eval_ground_truths, eval_sampling_params, step + 1, None)
 
 def evaluate_and_log(
     policy: PreTrainedModel,
     vllm_model: LLM,
-    reward_fn: Callable[[str, str], [str, dict]],
+    reward_fn: Callable[[str, str], [str, float]],
     eval_prompts: list[str],
     eval_ground_truths: list[str],
     eval_sampling_params: SamplingParams,
@@ -442,6 +446,7 @@ def evaluate_and_log(
     output_file: Optional[str],
 ):
     """
+    Wrapper around evaluate_llm with wandb.
     """
     load_policy_into_vllm_instance(policy, vllm_model)
     avg_metrics = evaluate_vllm(
@@ -449,7 +454,7 @@ def evaluate_and_log(
         reward_fn=reward_fn,
         prompts=eval_prompts,
         ground_truths=eval_ground_truths,
-        sampling_params=eval_sampling_params,
+        eval_sampling_params=eval_sampling_params,
         output_file=output_file,
     )
     if wandb.run is not None:
