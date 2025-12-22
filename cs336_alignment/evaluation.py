@@ -8,6 +8,7 @@ import numpy as np
 import os
 import torch
 from transformers import PreTrainedModel
+from typing import Optional
 from unittest.mock import patch
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
@@ -18,7 +19,7 @@ def evaluate_vllm(
     prompts: list[str],
     ground_truths: list[str],
     eval_sampling_params: SamplingParams,
-    output_file: str,
+    output_file: Optional[str],
 ) -> dict[str, float]:
     """
     Evaluate a language model on a list of prompts,
@@ -61,10 +62,11 @@ def evaluate_vllm(
     print("-" * 40)
 
     # Serialize to disk
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, "w") as f:
-        for res in results:
-            f.write(json.dumps(res) + "\n")
+    if output_file is not None:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, "w") as f:
+            for res in results:
+                f.write(json.dumps(res) + "\n")
 
     return avg_metrics
 

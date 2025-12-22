@@ -6,13 +6,12 @@ import os
 import torch
 import typer
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import Optional
 from vllm import SamplingParams
 import wandb
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.evaluation import evaluate_vllm, init_vllm, load_policy_into_vllm_instance
-from cs336_alignment.rl import train_grpo
+from cs336_alignment.evaluation import init_vllm
+from cs336_alignment.rl import train_grpo, evaluate_and_log
 from cs336_alignment.scripts.run_baseline import load_prompts_and_gts
 
 app = typer.Typer()
@@ -35,7 +34,7 @@ def main(
     use_std_normalization: bool = True,
     eval_interval: int = 10,
     output_dir_base: str = "/gpfs/radev/home/ax46/scratch/A5/rl",
-    sdt_device: str = "cuda:0",
+    rl_device: str = "cuda:0",
     vllm_device: str = "cuda:1",
 ):
     """
@@ -46,12 +45,12 @@ def main(
     output_dir = os.path.join(output_dir_base, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    device = torch.device(sft_device)
+    device = torch.device(rl_device)
 
     wandb.init(
         entity="andrew-xu",
         project="cs336-a5-rl",
-        name=run_name.
+        name=run_name,
         config={
             "model_path": model_path,
             "n_grpo_steps": n_grpo_steps,
@@ -112,10 +111,25 @@ def main(
         use_std_normalization=use_std_normalization,
         cliprange=cliprange,
         device=device,
-        eval_prompts=eval_prompts[:1024],  # Subset for faster eval
-        eval_ground_truths=eval_ground_truths[:1024],
+        eval_prompts=eval_prompts,
+        eval_ground_truths=eval_ground_truths,
         eval_interval=eval_interval,
     )
+
+    # Evaluate final model
+    eval_sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        min_tokens=4,
+        max_tokens=1024,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+    eval_dir_base="results/grpo"
+    eval_dir = os.path.join(eval_dir_base, run_name)
+    os.makedirs(eval_dir, exist_ok=True)
+    eval_output_file = os.path.join(eval_dir, "eval.jsonl")
+    evaluate_and_log(policy, vllm_model, r1_zero_reward_fn, eval_prompts, eval_ground_truths, eval_sampling_params, n_grpo_steps, eval_output_file)
 
     # Save final model
     policy.save_pretrained(output_dir)

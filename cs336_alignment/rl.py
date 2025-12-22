@@ -8,7 +8,7 @@ from typing import Callable, Literal, Optional
 from vllm import LLM, SamplingParams
 import wandb
 
-from cs336_alignment.evaluation import load_policy_into_vllm_instance
+from cs336_alignment.evaluation import load_policy_into_vllm_instance, evaluate_vllm
 from cs336_alignment.functional import tokenize_prompt_and_output, get_response_log_probs
 
 def compute_group_normalized_rewards(
@@ -57,10 +57,10 @@ def compute_group_normalized_rewards(
         advantages = advantages / (stds + advantage_eps)
     
     metadata = {
-        "means": means,
-        "stds": stds if normalize_by_std else 0,
-        "maxes": rewards.max(dim=-1)[0],
-        "mins": rewards.min(dim=-1)[0],
+        "mean": means.mean(),
+        "std": stds.mean() if normalize_by_std else 0,
+        "max": rewards.max(),
+        "min": rewards.min(),
     }
     return advantages.view(-1), rewards.view(-1), metadata
 
@@ -250,19 +250,22 @@ def train_grpo(
     epochs_per_rollout_batch: int = 1, # on-policy
     train_batch_size: int = 256, # on-policy
     gradient_accumulation_steps: int = 128,
-    gpu_memory_utilization: float = 0.85,
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = "reinforce_with_baseline",
     use_std_normalization: bool = True,
     cliprange: float = 0.2,
     max_gradient: float = 1.0,
     rl_device: str = "cuda:0",
-    vllm_device: str = "cuda:1",
     eval_prompts: list[str] = None,
     eval_ground_truths: list[str] = None,
     eval_interval: int = 10,
 ) -> None:
     """
     GRPO training loop.
+
+    Requires
+    1. train_batch_size // gradient_accumulation_steps == 0
+    2. rollout_batch_size // group_size == 0 (n_prompts * group_size)
+    3. train_batch_size >= group_size
 
     # TODO: add more details.
     """
@@ -284,6 +287,15 @@ def train_grpo(
     # Sampling params for vLLM
     sampling_params = SamplingParams(
         n=group_size,
+        temperature=sampling_temperature,
+        top_p=1.0,
+        min_tokens=sampling_min_tokens,
+        max_tokens=sampling_max_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+    )
+
+    eval_sampling_params = SamplingParams(
         temperature=sampling_temperature,
         top_p=1.0,
         min_tokens=sampling_min_tokens,
@@ -339,13 +351,14 @@ def train_grpo(
         )
 
         # Log reward stats
-        print(f"  Mean reward: {raw_reward}")
+        print(f"  Mean reward: {reward_metadata["mean"]}")
         if wandb.run is not None:
             wandb.log({
-                "train/reward_mean": None,
-                "train/reward_max": None,
-                "train/reward_min": None,
-                "train/step": step + 1,
+                "grpo/reward_mean": reward_metadata["mean"],
+                "grpo/reward_std": reward_metadata["std"],
+                "grpo/reward_max": reward_metadata["max"],
+                "grpo/reward_min": reward_metadata["min"],
+                "grpo/step": step + 1,
             })
 
         # Tokenize all rollouts
@@ -367,9 +380,7 @@ def train_grpo(
             old_log_probs = None
 
         # Inner training loop
-        n_train_steps = epochs_per_rollout_batch * (rollout_batch_size // train_batch_size)
-
-        for epoch in range(epochs_per_rollout_batch):
+        for _ in range(epochs_per_rollout_batch):
             # Shuffle indices for this epoch
             perm = torch.randomperm(rollout_batch_size)
 
@@ -389,7 +400,7 @@ def train_grpo(
                 )
 
                 # Compute loss and backward
-                loss, metadata = grpo_microbatch_train_step(
+                _, metadata = grpo_microbatch_train_step(
                     policy_log_probs=policy_log_probs,
                     response_mask=mb_response_mask,
                     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -411,26 +422,40 @@ def train_grpo(
                         log_dict = {
                             "train/loss": metadata["unscaled_loss"].item(),
                             "train/grad_norm": grad_norm.item(),
+                            "train/avg_token_entropy": policy_log_probs["token_entropy"].mean(),
                         }
                         if "clip_fraction" in metadata:
                             log_dict["train/clip_fraction"] = metadata["clip_fraction"].item()
                         wandb.log(log_dict)
 
         if eval_prompts is not None and (step + 1) % eval_interval == 0:
-            evaluate_and_log(policy, vllm_model, reward_fn, eval_prompts, eval_ground_truths, step + 1)
+            evaluate_and_log(policy, vllm_model, reward_fn, eval_prompts, eval_ground_truths, eval_sampling_params, step + 1, None)
 
-"""
-And here are a few additional tips:
-• Remember to use the r1_zero prompt, and direct vLLM to stop generation at the second answer tag
-</answer>, as in the previous experiments.
-• We suggest using typer for argument parsing.
-• You should routinely log validation rewards (e.g., every 5 or 10 steps). You should evaluate on at least
-1024 validation examples to compare hyperparameters, as CoT/RL evaluations can be noisy.
-• You should log some or all of the following for each optimizer update:
-– Token entropy.
-– Train rewards (total, format, and answer).
-
-FIX WANDB LOGGING
-
-GET THE METRICS THING
-"""
+def evaluate_and_log(
+    policy: PreTrainedModel,
+    vllm_model: LLM,
+    reward_fn: Callable[[str, str], [str, dict]],
+    eval_prompts: list[str],
+    eval_ground_truths: list[str],
+    eval_sampling_params: SamplingParams,
+    step: int,
+    output_file: Optional[str],
+):
+    """
+    """
+    load_policy_into_vllm_instance(policy, vllm_model)
+    avg_metrics = evaluate_vllm(
+        vllm_model=vllm_model,
+        reward_fn=reward_fn,
+        prompts=eval_prompts,
+        ground_truths=eval_ground_truths,
+        sampling_params=eval_sampling_params,
+        output_file=output_file,
+    )
+    if wandb.run is not None:
+        wandb.log({
+            "eval/avg_format_reward": avg_metrics["format_reward"],
+            "eval/answer_reward": avg_metrics["answer_reward"],
+            "eval/reward": avg_metrics["reward"],
+            "eval/step": step,
+        })
