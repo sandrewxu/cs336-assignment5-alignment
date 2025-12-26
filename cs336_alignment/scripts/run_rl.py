@@ -5,6 +5,7 @@ Use RL (GRPO) to finetune a model on a test set
 import os
 import torch
 import typer
+from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 import wandb
@@ -31,7 +32,8 @@ def main(
     learning_rate: float = 1e-5,
     loss_type: str = "reinforce_with_baseline",
     cliprange: float = 0.2,
-    use_std_normalization: bool = True,
+    constant_normalize_factor: Optional[str] = None,
+    use_std_normalization: Optional[str] = None,
     eval_interval: int = 10,
     output_dir_base: str = "/gpfs/radev/home/ax46/scratch/A5/rl",
     rl_device: str = "cuda:0",
@@ -40,8 +42,22 @@ def main(
     """
     Run GRPO training on MATH dataset
     """
+    # Parse constant_normalize_factor: convert "None" string to None, or convert to int
+    if constant_normalize_factor is None or constant_normalize_factor == "None" or constant_normalize_factor == "":
+        constant_normalize_factor_int = None
+    else:
+        constant_normalize_factor_int = int(constant_normalize_factor)
+    
+    # Parse use_std_normalization: convert string to boolean
+    if use_std_normalization is None or use_std_normalization == "":
+        use_std_normalization_bool = True  # default
+    else:
+        use_std_normalization_bool = use_std_normalization.lower() in ("true", "1", "yes", "on")
+    
     # Directory mapping
-    run_name = f"grpo_{loss_type}_G{group_size}_rb_{rollout_batch_size}_lr{learning_rate}"
+    norm_suffix = f"_lenNorm{constant_normalize_factor_int}" if constant_normalize_factor_int else "_noLenNorm"
+    std_suffix = "_stdNorm" if use_std_normalization_bool else "_noStdNorm"
+    run_name = f"grpo_{loss_type}_G{group_size}_rb_{rollout_batch_size}_tb{train_batch_size}_epochs{epochs_per_rollout_batch}_lr{learning_rate}{norm_suffix}{std_suffix}"
     output_dir = os.path.join(output_dir_base, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -62,6 +78,8 @@ def main(
             "learning_rate": learning_rate,
             "loss_type": loss_type,
             "cliprange": cliprange,
+            "constant_normalize_factor": constant_normalize_factor_int,
+            "use_std_normalization": use_std_normalization_bool,
         }
     )
 
@@ -108,8 +126,9 @@ def main(
         train_batch_size=train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         loss_type=loss_type,
-        use_std_normalization=use_std_normalization,
+        use_std_normalization=use_std_normalization_bool,
         cliprange=cliprange,
+        constant_normalize_factor=constant_normalize_factor_int,
         rl_device=device,
         eval_prompts=eval_prompts[:1024],
         eval_ground_truths=eval_ground_truths[:1024],

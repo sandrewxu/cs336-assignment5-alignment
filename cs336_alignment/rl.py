@@ -9,7 +9,7 @@ from vllm import LLM, SamplingParams
 import wandb
 
 from cs336_alignment.evaluation import load_policy_into_vllm_instance, evaluate_vllm
-from cs336_alignment.functional import tokenize_prompt_and_output, get_response_log_probs
+from cs336_alignment.functional import tokenize_prompt_and_output, get_response_log_probs, masked_normalize
 
 def compute_group_normalized_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -120,7 +120,6 @@ def compute_grpo_clip_loss(
         clip_fraction = clip_matrix.float().mean()
 
     metadata = {
-        "clip_matrix": clip_matrix.detach(),
         "clip_fraction": clip_fraction,
         "ratio_mean": ratio.mean(),
     }
@@ -188,6 +187,7 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    constant_normalize_factor: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Compute the policy gradient loss and backprop its gradients for a microbatch.
@@ -224,7 +224,10 @@ def grpo_microbatch_train_step(
         old_log_probs,
         cliprange
     )
-    sequence_losses = masked_mean(loss, response_mask, dim=-1)
+    if constant_normalize_factor:
+        sequence_losses = masked_normalize(loss, response_mask, constant_normalize_factor, dim=-1)
+    else:
+        sequence_losses = masked_mean(loss, response_mask, dim=-1)
     raw_loss = torch.mean(sequence_losses)
     scaled_loss = raw_loss / gradient_accumulation_steps
     scaled_loss.backward()
@@ -253,6 +256,7 @@ def train_grpo(
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = "reinforce_with_baseline",
     use_std_normalization: bool = True,
     cliprange: float = 0.2,
+    constant_normalize_factor: Optional[int] = None,
     max_gradient: float = 1.0,
     rl_device: str = "cuda:0",
     eval_prompts: list[str] = None,
@@ -371,12 +375,18 @@ def train_grpo(
         advantages = advantages.to(rl_device)
         raw_rewards = raw_rewards.to(rl_device)
 
-        # Compute old log probs once (for GRPO-Clip)
+        # Compute old log probs once (for GRPO-Clip), in microbatches to reduce peak memory
         if loss_type == "grpo_clip":
             policy.eval()
+            old_log_probs_chunks = []
             with torch.inference_mode():
-                old_log_probs_result = get_response_log_probs(policy, input_ids, labels)
-                old_log_probs = old_log_probs_result["log_probs"]
+                for start in range(0, rollout_batch_size, micro_train_batch_size):
+                    end = start + micro_train_batch_size
+                    mb_input_ids = input_ids[start:end]
+                    mb_labels = labels[start:end]
+                    old_mb_result = get_response_log_probs(policy, mb_input_ids, mb_labels)
+                    old_log_probs_chunks.append(old_mb_result["log_probs"])
+            old_log_probs = torch.cat(old_log_probs_chunks, dim=0)
             policy.train()
         else:
             old_log_probs = None
@@ -412,6 +422,7 @@ def train_grpo(
                     advantages=mb_advantages,
                     old_log_probs=mb_old_log_probs,
                     cliprange=cliprange,
+                    constant_normalize_factor=constant_normalize_factor,
                 )
 
                 if (micro_step // micro_train_batch_size + 1) % gradient_accumulation_steps == 0:
